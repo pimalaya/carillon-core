@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file, following [Keep
 
 ### Added
 
-- Scaffolded the crate: the content-free `CarillonEvent` and `CarillonSource`, the `CarillonBackend` source description with its `CarillonImapBackend`, `CarillonCardDavBackend` and `CarillonTransportClass`, the resolved `CarillonCredential`, and the one-session `watch` entry point with `CarillonWatchError`.
+- Scaffolded the crate: the content-free `CarillonEvent` and `CarillonSource`, the `CarillonBackend` source description with its `CarillonImapBackend`, `CarillonCardDavBackend` and `CarillonTransportClass`, and the resolved `CarillonCredential`.
 
-  The watch entry point is stubbed pending the relocation of the IMAP and CardDAV clients out of carillon-backend into core.
+- Added the IMAP watch behind the `imap` feature: `imap::watch` greets, authenticates (`LOGIN` or SASL `OAUTHBEARER`), then holds IDLE and rings a content-free event when the mailbox state (`UIDVALIDITY:UIDNEXT`) advances, driven over a caller-owned async stream. Errors surface as `CarillonWatchError`.
+
+  Core is generic over the stream and does not own the transport: the frontend opens the connection (TCP, TLS, any address policy) and owns reconnect. Rings on new mail; a CONDSTORE `HIGHESTMODSEQ` token is a later refinement. The CardDAV poll is not wired yet.

@@ -13,12 +13,12 @@ Core stops at the state. It does not resolve what changed, and it exposes no cha
 The governing choice is that core is an async client, not a sans-io coroutine layer. A sans-io watch aggregator would repeat the retired io-email pattern, an interface whose upkeep outweighs what it saves. Core owns the async network I/O of watching directly, the way every other Pimalaya consumer rebuilds its own client over io-imap and io-webdav. The carillon-backend repository hosts core as a server; its cairn/changes/carillon-core-split change carries the full split rationale.
 
 ### Requirement: An async watch client, not sans-io
-carillon-core SHALL be an async watch client that owns the network I/O of watching over the protocol clients (io-imap now, io-jmap and io-webdav later). It SHALL NOT be a sans-io coroutine layer, and it SHALL NOT depend on a datastore, a keyring, an OAuth token exchange, a notification library, process spawning, or the delivery and consumer fan-out. Those effects SHALL be supplied upstream by a frontend.
+carillon-core SHALL be an async watch client that drives the protocol clients (io-imap now, io-jmap and io-webdav later) over a caller-owned async stream. It SHALL be generic over that stream and SHALL NOT own the transport: opening the connection (TCP, TLS, keepalive, any address or SSRF policy) and reconnect are the frontend's. It SHALL NOT be a sans-io coroutine layer, and it SHALL NOT depend on a TLS stack, a datastore, a keyring, an OAuth token exchange, a notification library, process spawning, or the delivery and consumer fan-out. Those effects SHALL be supplied upstream by a frontend.
 
 #### Scenario: A watcher bug is fixed once
-- **GIVEN** a reconnection or liveness defect in the watch loop
+- **GIVEN** a defect in the per-session watch (a mishandled IDLE wake, a missed dead socket)
 - **WHEN** it is fixed in carillon-core
-- **THEN** both the CLI daemon and the server receive the fix, with no duplicated loop to fix twice
+- **THEN** both the CLI daemon and the server receive the fix, with no duplicated per-session watcher to fix twice
 
 ### Requirement: The event is content-free and self-addressed
 A watch SHALL, on a detected change, construct exactly one content-free, self-addressed event carrying `(id, ts, account, source, target, state)` and nothing more. It SHALL NOT carry a UID, a resource href, a change kind, or any message content. The `id` and `ts` SHALL be stamped once at fold and stable across retries. The `state` SHALL be the opaque per-source resync token, or absent when the source exposes none.
@@ -47,9 +47,17 @@ Every source SHALL report a transport class: `standing-connection` (dials out an
 - **THEN** the frontend refuses to arm it, and never offers Gmail as a watchable source there
 
 ### Requirement: The watch entry point runs one session
-The core watch entry point SHALL run one session: connect, watch, and ring into a channel until the server ends the session or a shutdown is requested. Reconnect, backoff, and credential resolution SHALL live upstream, so the frontend can resolve a fresh credential per attempt and keep credential residency minimal.
+The core watch entry point SHALL run one session over a stream the frontend opened: greet, authenticate, watch, and ring into a channel until the stream drops or a shutdown is requested. Reconnect, backoff, transport, and credential resolution SHALL live upstream, so the frontend opens a fresh connection and resolves a fresh credential per attempt, keeping credential residency minimal.
 
 #### Scenario: The session drops
 - **GIVEN** a running watch session
 - **WHEN** the connection is lost
 - **THEN** the core entry point returns, and the frontend decides whether and when to reconnect
+
+### Requirement: The IMAP watch is IDLE plus EXAMINE, not a delta watcher
+Because the ring is content-free, the IMAP watch SHALL NOT compute structured per-message deltas. It SHALL require only IDLE: greet, authenticate, read the mailbox state by a read-only EXAMINE, then hold IDLE and, on each wake, re-EXAMINE and ring only when the state token advanced. The state token SHALL be `UIDVALIDITY:UIDNEXT`, advancing on new mail; a CONDSTORE `HIGHESTMODSEQ` token, advancing on flag and delete changes too, is an allowed refinement. QRESYNC SHALL NOT be required.
+
+#### Scenario: A flag change on a CONDSTORE-less server
+- **GIVEN** an IMAP watch using the `UIDVALIDITY:UIDNEXT` token
+- **WHEN** a message flag changes but no new mail arrives
+- **THEN** IDLE wakes, the re-EXAMINE finds the token unchanged, and core does not ring, until the HIGHESTMODSEQ refinement lands

@@ -6,6 +6,8 @@
 //! since the consumer holds the credentials and can go look. This mirrors
 //! JMAP's StateChange: enough to address and dedup, and nothing more.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use rand::RngExt;
 use serde::Serialize;
 
@@ -75,8 +77,6 @@ fn new_id() -> String {
 
 /// Returns the current Unix time in seconds, or 0 before the epoch.
 fn now_secs() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs() as i64)

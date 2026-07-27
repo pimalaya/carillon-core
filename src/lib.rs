@@ -18,11 +18,13 @@
 //!
 //! Core owns the change signal ([`event::CarillonEvent`]), the source to
 //! watch ([`backend::CarillonBackend`]), the resolved credential it
-//! presents ([`credential::CarillonCredential`]), and the entry point that
-//! runs one session ([`client::watch`]). Core does not own credential
-//! resolution: keyring lookup and OAuth minting happen upstream, so a
-//! secret arrives already resolved. Core does not own storage, billing,
-//! delivery, or consumer fan-out either. Those stay at the frontend edge.
+//! presents ([`credential::CarillonCredential`]), and the per-protocol
+//! watch conversation ([`imap::watch`]). Core does not own the transport:
+//! the frontend opens the stream (TCP, TLS, keepalive, any address or SSRF
+//! policy) and owns reconnect, so core stays TLS-agnostic and generic over
+//! the async stream. Core does not own credential resolution (keyring
+//! lookup and OAuth minting happen upstream), storage, billing, delivery,
+//! or consumer fan-out either. Those stay at the frontend edge.
 //!
 //! ## Transport classes
 //!
@@ -36,10 +38,13 @@
 //!
 //! The modules are flat. The event module holds the signal, the backend
 //! module the source description and its transport class, the credential
-//! module the presented secret, and the client module the watch entry
-//! point and its error. The design history lives under cairn/.
+//! module the presented secret, the error module the watch result and
+//! error, and the imap module the IMAP watch conversation driven over a
+//! caller-owned stream. The design history lives under cairn/.
 
 pub mod backend;
-pub mod client;
 pub mod credential;
+pub mod error;
 pub mod event;
+#[cfg(feature = "imap")]
+pub mod imap;
