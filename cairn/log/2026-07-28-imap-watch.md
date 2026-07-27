@@ -14,7 +14,7 @@ The backend's `pump` was already stream-generic (`S: AsyncRead + AsyncWrite + Un
 
 ## The content-free watch is IDLE plus EXAMINE, not a delta watcher
 
-The backend uses io-imap's `ImapMailboxWatch` (IDLE + QRESYNC) to compute structured per-UID deltas (new, flags, removed). A content-free ring throws all of that away, so core does not need it. `imap::watch` greets, authenticates, reads the mailbox state by a read-only EXAMINE, then holds IDLE and, on each wake, re-EXAMINEs and rings only when the state advanced. The state token is `UIDVALIDITY:UIDNEXT`, so it rings on new mail. Only IDLE is required; QRESYNC is irrelevant. This is simpler than porting the delta watcher and still yields the resync token the event carries.
+The backend uses io-imap's `ImapMailboxWatch` (IDLE + QRESYNC) to compute structured per-UID deltas (new, flags, removed). A content-free ring throws all of that away, so core does not need it. `imap::watch` greets, authenticates, reads the mailbox state by a read-only EXAMINE, then holds IDLE and, on each wake, re-EXAMINEs and rings only when the state advanced. On a CONDSTORE server the token is `UIDVALIDITY:HIGHESTMODSEQ`, read by an `EXAMINE (CONDSTORE)` and advancing on any change (new mail, flags, deletes); otherwise it is `UIDVALIDITY:UIDNEXT`, advancing on new mail only. Only IDLE is required; QRESYNC is irrelevant. This is simpler than porting the delta watcher and still yields the resync token the event carries.
 
 ## What landed
 
@@ -22,4 +22,4 @@ The backend uses io-imap's `ImapMailboxWatch` (IDLE + QRESYNC) to compute struct
 
 ## Deferred
 
-Rings on new mail only: a CONDSTORE `HIGHESTMODSEQ` token (ringing on flag and delete changes too) is the next refinement, since the EXAMINE data already exposes `highest_mod_seq`. The CardDAV poll (layer 2b) and the backend migration onto core (deleting its own session and pump) are separate stones.
+The CardDAV poll (layer 2b) and the backend migration onto core (deleting its own session and pump, and opening the transport core no longer owns) are separate stones.

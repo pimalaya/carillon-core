@@ -21,7 +21,7 @@ use io_imap::{
         login::{ImapLogin, ImapLoginOptions},
     },
     rfc7628::auth_oauthbearer::{ImapAuthOauthbearer, ImapAuthOauthbearerOptions},
-    types::{mailbox::Mailbox, response::Capability},
+    types::{command::SelectParameter, mailbox::Mailbox, response::Capability},
 };
 use log::{debug, trace};
 use secrecy::ExposeSecret;
@@ -47,10 +47,10 @@ const MAX_MESSAGE_SIZE: u32 = 1 << 20;
 /// until the stream drops or `shutdown` is set.
 ///
 /// This is one session. The caller opened the transport and owns
-/// reconnect; `account` tags each ring with the watch it belongs to. The
-/// state token is `UIDVALIDITY:UIDNEXT`, so a ring fires on new mail; a
-/// CONDSTORE `HIGHESTMODSEQ` upgrade (ringing on flag and delete changes
-/// too) is a later refinement.
+/// reconnect; `account` tags each ring with the watch it belongs to. On a
+/// CONDSTORE server the state token is `UIDVALIDITY:HIGHESTMODSEQ`, so a
+/// ring fires on any change (new mail, flags, deletes); otherwise it is
+/// `UIDVALIDITY:UIDNEXT`, ringing on new mail only.
 pub async fn watch<S>(
     account: &str,
     imap: &CarillonImapBackend,
@@ -103,11 +103,14 @@ where
     if !capabilities.contains(&Capability::Idle) {
         bail!("server does not advertise IDLE; cannot watch");
     }
+    let condstore = capabilities.contains(&Capability::CondStore)
+        || capabilities.contains(&Capability::QResync);
+    trace!("condstore state tracking: {condstore}");
 
     let mailbox = Mailbox::try_from(imap.mailbox.clone())
         .map_err(|_| anyhow!("invalid mailbox name: {}", imap.mailbox))?;
 
-    let mut state = examine_state(stream, &mut fragmentizer, &mailbox).await?;
+    let mut state = examine_state(stream, &mut fragmentizer, &mailbox, condstore).await?;
 
     loop {
         match pump::idle_once(stream, &mut fragmentizer, &shutdown).await? {
@@ -122,7 +125,7 @@ where
             pump::IdleOutcome::Data => {}
         }
 
-        let next = examine_state(stream, &mut fragmentizer, &mailbox).await?;
+        let next = examine_state(stream, &mut fragmentizer, &mailbox, condstore).await?;
         if next == state {
             continue;
         }
@@ -179,20 +182,32 @@ where
     }
 }
 
-/// Reads the mailbox state token by a read-only `EXAMINE`:
-/// `UIDVALIDITY:UIDNEXT`. A change in `UIDVALIDITY` (a mailbox reset) or a
-/// rise in `UIDNEXT` (new mail) advances the token and triggers a ring.
+/// Reads the mailbox state token by a read-only `EXAMINE`. With `condstore`
+/// the token is `UIDVALIDITY:HIGHESTMODSEQ`, which advances on any change
+/// (new mail, flags, deletes); otherwise `UIDVALIDITY:UIDNEXT`, which
+/// advances on new mail only. A `UIDVALIDITY` change (a mailbox reset) also
+/// advances it.
 async fn examine_state<S>(
     stream: &mut S,
     fragmentizer: &mut Fragmentizer,
     mailbox: &Mailbox<'static>,
+    condstore: bool,
 ) -> Result<String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let examine = ImapMailboxExamine::new(mailbox.clone(), ImapMailboxExamineOptions::default());
+    let parameters = if condstore {
+        vec![SelectParameter::CondStore]
+    } else {
+        Vec::new()
+    };
+    let examine =
+        ImapMailboxExamine::new(mailbox.clone(), ImapMailboxExamineOptions { parameters });
     let data = pump::run(stream, fragmentizer, examine).await??;
     let validity = data.uid_validity.map(|v| v.get()).unwrap_or(0);
-    let next = data.uid_next.map(|u| u.get()).unwrap_or(0);
-    Ok(format!("{validity}:{next}"))
+    let seq = data
+        .highest_mod_seq
+        .or_else(|| data.uid_next.map(|u| u64::from(u.get())))
+        .unwrap_or(0);
+    Ok(format!("{validity}:{seq}"))
 }

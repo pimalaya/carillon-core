@@ -55,9 +55,14 @@ The core watch entry point SHALL run one session over a stream the frontend open
 - **THEN** the core entry point returns, and the frontend decides whether and when to reconnect
 
 ### Requirement: The IMAP watch is IDLE plus EXAMINE, not a delta watcher
-Because the ring is content-free, the IMAP watch SHALL NOT compute structured per-message deltas. It SHALL require only IDLE: greet, authenticate, read the mailbox state by a read-only EXAMINE, then hold IDLE and, on each wake, re-EXAMINE and ring only when the state token advanced. The state token SHALL be `UIDVALIDITY:UIDNEXT`, advancing on new mail; a CONDSTORE `HIGHESTMODSEQ` token, advancing on flag and delete changes too, is an allowed refinement. QRESYNC SHALL NOT be required.
+Because the ring is content-free, the IMAP watch SHALL NOT compute structured per-message deltas. It SHALL require only IDLE: greet, authenticate, read the mailbox state by a read-only EXAMINE, then hold IDLE and, on each wake, re-EXAMINE and ring only when the state token advanced. On a CONDSTORE server the token SHALL be `UIDVALIDITY:HIGHESTMODSEQ`, read by an `EXAMINE (CONDSTORE)` and advancing on any change (new mail, flags, deletes); otherwise it SHALL be `UIDVALIDITY:UIDNEXT`, advancing on new mail only. QRESYNC SHALL NOT be required.
 
-#### Scenario: A flag change on a CONDSTORE-less server
-- **GIVEN** an IMAP watch using the `UIDVALIDITY:UIDNEXT` token
+#### Scenario: A flag change on a CONDSTORE server
+- **GIVEN** an IMAP watch on a CONDSTORE server, using the `UIDVALIDITY:HIGHESTMODSEQ` token
 - **WHEN** a message flag changes but no new mail arrives
-- **THEN** IDLE wakes, the re-EXAMINE finds the token unchanged, and core does not ring, until the HIGHESTMODSEQ refinement lands
+- **THEN** IDLE wakes, the re-EXAMINE finds HIGHESTMODSEQ advanced, and core rings
+
+#### Scenario: A flag change without CONDSTORE
+- **GIVEN** an IMAP watch on a server without CONDSTORE, using the `UIDVALIDITY:UIDNEXT` token
+- **WHEN** a message flag changes but no new mail arrives
+- **THEN** IDLE wakes, the re-EXAMINE finds the token unchanged, and core does not ring (new mail only, the honest limit of a CONDSTORE-less server)
