@@ -1,60 +1,59 @@
-//! The canonical knock-knock event.
+//! The change signal a watch emits.
 //!
-//! A watch says only *"something changed at this address"* — never what
-//! changed. No sender, subject, or body; no UID, no resource href, no
-//! change kind. Enriching the signal is a downstream consumer's job (it
-//! holds the credentials and can go look). This is JMAP's `StateChange`:
-//! enough to address and dedup, and nothing more.
-//!
-//! [`id`](Event::id) and [`ts`](Event::ts) are stamped once, at fold time,
-//! so every retry of the same ring carries the same id, timestamp, and
-//! (downstream) signature.
+//! A watch says only that something changed at an address, never what
+//! changed. The signal carries no sender, subject, body, UID, resource
+//! href, or change kind. Enriching it is a downstream consumer's job,
+//! since the consumer holds the credentials and can go look. This mirrors
+//! JMAP's StateChange: enough to address and dedup, and nothing more.
 
 use rand::RngExt;
 use serde::Serialize;
 
 /// Which kind of source rang the doorbell.
+///
+/// Tags a [`CarillonEvent`] with its origin protocol so a consumer can
+/// route without parsing the target string.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Source {
-    /// An IMAP mailbox (held IDLE, QRESYNC where available).
+pub enum CarillonSource {
+    /// An IMAP mailbox watched over a held IDLE connection.
     Imap,
-    /// A CardDAV addressbook collection (polled).
+    /// A CardDAV addressbook collection watched by polling.
     CardDav,
 }
 
 /// A content-free, self-addressed change signal.
 ///
-/// "Content-free" is not "anonymous": the ring stays self-identifying, so
-/// a consumer can route (*which* target changed) and dedup (*already
-/// handled this state*). A dropped or duplicated ring is harmless — the
-/// consumer re-derives truth on the next one.
+/// Content-free is not anonymous. The event stays self-identifying, so a
+/// consumer can route (which target rang) and dedup (whether this state
+/// was already handled). A dropped or duplicated event is harmless, since
+/// the consumer re-derives truth on the next one.
 #[derive(Clone, Debug, Serialize)]
-pub struct Event {
-    /// Stable across retries so receivers dedup; signed for replay
-    /// protection downstream.
+pub struct CarillonEvent {
+    /// Unique id, stable across retries so a receiver can dedup and a
+    /// downstream signature covers a constant value.
     pub id: String,
-    /// Unix seconds, stamped once at fold, stable across retries.
+    /// Unix timestamp in seconds, stamped once at fold and stable across
+    /// retries.
     pub ts: i64,
-    /// The watch (account) this ring belongs to.
+    /// The watch (account) this signal belongs to.
     pub account: String,
     /// Which source rang.
-    pub source: Source,
-    /// The addressed target: an IMAP mailbox, a CardDAV collection.
+    pub source: CarillonSource,
+    /// The addressed target: an IMAP mailbox name or a CardDAV collection.
     pub target: String,
-    /// Opaque source state for dedup / resync (IMAP `UIDNEXT` or `MODSEQ`,
-    /// CardDAV sync-token, JMAP state). `None` when the source exposes
-    /// none.
+    /// Opaque per-source state used to resync, such as an IMAP UIDNEXT or
+    /// MODSEQ, or a CardDAV sync-token. None when the source exposes none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
 }
 
-impl Event {
-    /// Folds a ring for `account` / `source` / `target`, stamping a fresh
-    /// id and timestamp.
+impl CarillonEvent {
+    /// Folds a ring for the given account, source, and target, stamping a
+    /// fresh id and timestamp.
     pub fn ring(
         account: impl Into<String>,
-        source: Source,
+        source: CarillonSource,
         target: impl Into<String>,
         state: Option<String>,
     ) -> Self {
@@ -69,12 +68,12 @@ impl Event {
     }
 }
 
-/// A 128-bit random, hex-encoded event id.
+/// Builds a 128-bit random, hex-encoded event id.
 fn new_id() -> String {
     format!("{:032x}", rand::rng().random::<u128>())
 }
 
-/// Unix seconds now, or `0` if the clock is before the epoch.
+/// Returns the current Unix time in seconds, or 0 before the epoch.
 fn now_secs() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
 

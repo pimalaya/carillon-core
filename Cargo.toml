@@ -1,20 +1,20 @@
 [package]
 name = "carillon-core"
-description = "Shared async watch client for Carillon (CLI daemon + server)"
+description = "Shared async watch client for Carillon"
 version = "0.0.0"
-authors = ["soywod <clement.douin@posteo.net>"]
-edition = "2024"
+authors = ["soywod <pimalaya.org@posteo.net>"]
 rust-version = "1.88"
+edition = "2024"
 license = "MIT OR Apache-2.0"
+categories = ["email", "asynchronous"]
+keywords = ["watch", "imap", "carddav", "idle", "notification"]
 homepage = "https://pimalaya.org"
+documentation = "https://docs.rs/carillon-core/latest/carillon_core"
 repository = "https://github.com/pimalaya/carillon-core"
-categories = ["email"]
-keywords = ["imap", "carddav", "watch", "idle", "notification"]
 
-[features]
-default = ["imap"]
-imap = []
-carddav = []
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 rand = "0.10"
