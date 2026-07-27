@@ -1,0 +1,24 @@
+[package]
+name = "carillon-core"
+description = "Shared async watch client for Carillon (CLI daemon + server)"
+version = "0.0.0"
+authors = ["soywod <clement.douin@posteo.net>"]
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+homepage = "https://pimalaya.org"
+repository = "https://github.com/pimalaya/carillon-core"
+categories = ["email"]
+keywords = ["imap", "carddav", "watch", "idle", "notification"]
+
+[features]
+default = ["imap"]
+imap = []
+carddav = []
+
+[dependencies]
+rand = "0.10"
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["sync"] }
