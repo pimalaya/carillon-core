@@ -1,213 +1,366 @@
-//! IMAP watching over an async stream.
+//! IMAP watching as an I/O-free coroutine.
 //!
-//! The transport is the frontend's: it opens the stream (TCP, TLS,
-//! keepalive, any address or SSRF policy) and owns reconnect. Core owns the
-//! IMAP conversation over that stream. Because the ring is content-free,
-//! core does not need io-imap's QRESYNC delta watcher: it greets,
-//! authenticates, then holds IDLE and, on each wake, re-EXAMINEs to read
-//! the mailbox state and rings only when that state advanced. Only IDLE is
-//! required; QRESYNC is irrelevant here.
+//! Core does no I/O. [`CarillonImapWatch`] is a state machine that composes
+//! io-imap's own coroutines (greeting, authentication, EXAMINE, IDLE) and,
+//! on each [`resume`](CarillonImapWatch::resume), returns what the driver
+//! must do next: read, write, mint a ring for a changed state, or stop. A
+//! driver (a frontend, blocking or async) owns the socket, the timeouts,
+//! and turning a [`CarillonImapWatchProgress::Changed`] into a
+//! [`CarillonEvent`](crate::event::CarillonEvent). Only IDLE is required; the state token is
+//! content-free.
+//!
+//! Because the ring is content-free, core does not need io-imap's QRESYNC
+//! delta watcher: it greets, authenticates, EXAMINEs for the initial state,
+//! then holds IDLE and, on each wake, re-EXAMINEs and surfaces a change
+//! when the state token advanced.
 
-mod pump;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
-use std::sync::{Arc, atomic::AtomicBool};
-
-use anyhow::{Context, Result, anyhow, bail};
 use io_imap::{
     codec::fragmentizer::Fragmentizer,
+    coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
+    rfc2177::idle::{ImapIdle, ImapIdleOptions, ImapIdleYield},
     rfc3501::{
-        examine::{ImapMailboxExamine, ImapMailboxExamineOptions},
+        examine::{ExamineData, ImapMailboxExamine, ImapMailboxExamineOptions},
         greeting::{ImapGreetingGet, ImapGreetingGetOptions},
         login::{ImapLogin, ImapLoginOptions},
     },
     rfc7628::auth_oauthbearer::{ImapAuthOauthbearer, ImapAuthOauthbearerOptions},
     types::{command::SelectParameter, mailbox::Mailbox, response::Capability},
 };
-use log::{debug, trace};
 use secrecy::ExposeSecret;
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    sync::mpsc,
-};
 
 use crate::{
     backend::CarillonImapBackend,
     credential::CarillonCredential,
     error::{CarillonWatchError, CarillonWatchResult},
-    event::{CarillonEvent, CarillonSource},
 };
 
 /// Safety bound on the parser buffer. Only mailbox status is read, never a
-/// body, so it never needs to grow large; the fragmentizer grows lazily
-/// into it.
+/// body, so it never needs to grow large; the fragmentizer grows lazily.
 const MAX_MESSAGE_SIZE: u32 = 1 << 20;
 
-/// Watches an IMAP mailbox over an already-opened `stream`, ringing a
-/// content-free [`CarillonEvent`] whenever the mailbox state advances,
-/// until the stream drops or `shutdown` is set.
+/// What the driver must do to make progress, returned by each
+/// [`CarillonImapWatch::resume`].
+pub enum CarillonImapWatchProgress {
+    /// Read from the socket and pass the bytes to the next `resume`.
+    WantsRead,
+    /// Write these bytes to the socket, then `resume` again with no input.
+    WantsWrite(Vec<u8>),
+    /// The mailbox state advanced to this token. Mint and dispatch a
+    /// [`CarillonEvent`](crate::event::CarillonEvent) from it, then `resume` again with no input.
+    Changed(String),
+    /// The watch finished: shutdown was requested, or an error occurred.
+    Done(CarillonWatchResult<()>),
+}
+
+/// An I/O-free IMAP watch.
 ///
-/// This is one session. The caller opened the transport and owns
-/// reconnect; `account` tags each ring with the watch it belongs to. On a
-/// CONDSTORE server the state token is `UIDVALIDITY:HIGHESTMODSEQ`, so a
-/// ring fires on any change (new mail, flags, deletes); otherwise it is
-/// `UIDVALIDITY:UIDNEXT`, ringing on new mail only.
-pub async fn watch<S>(
-    account: &str,
-    imap: &CarillonImapBackend,
-    credential: &CarillonCredential,
-    stream: &mut S,
-    events: &mpsc::Sender<CarillonEvent>,
+/// Greets, authenticates (`LOGIN` or SASL `OAUTHBEARER`), reads the initial
+/// mailbox state by a read-only EXAMINE, then holds IDLE and, on each wake,
+/// re-EXAMINEs and surfaces a [`CarillonImapWatchProgress::Changed`] when
+/// the state token advanced. With CONDSTORE the token is
+/// `UIDVALIDITY:HIGHESTMODSEQ` (advancing on any change); otherwise
+/// `UIDVALIDITY:UIDNEXT` (new mail only).
+pub struct CarillonImapWatch {
+    imap: CarillonImapBackend,
+    credential: CarillonCredential,
+    mailbox: Mailbox<'static>,
+    fragmentizer: Fragmentizer,
     shutdown: Arc<AtomicBool>,
-) -> CarillonWatchResult<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    watch_session(account, imap, credential, stream, events, shutdown)
-        .await
-        .map_err(|err| CarillonWatchError::Imap(format!("{err:#}")))
-}
-
-/// The watch session as an `anyhow` chain, mapped to the crate error at the
-/// public boundary above.
-async fn watch_session<S>(
-    account: &str,
-    imap: &CarillonImapBackend,
-    credential: &CarillonCredential,
-    stream: &mut S,
-    events: &mpsc::Sender<CarillonEvent>,
-    shutdown: Arc<AtomicBool>,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    debug!("begin imap watch");
-    trace!(
-        "account: {account}, host: {}, mailbox: {}",
-        imap.host, imap.mailbox
-    );
-
-    let mut fragmentizer = Fragmentizer::new(MAX_MESSAGE_SIZE);
-
-    let greeting_opts = ImapGreetingGetOptions {
-        ensure_capabilities: true,
-    };
-    pump::run(
-        stream,
-        &mut fragmentizer,
-        ImapGreetingGet::new(greeting_opts),
-    )
-    .await?
-    .context("IMAP greeting failed")?;
-
-    let capabilities = authenticate(stream, &mut fragmentizer, imap, credential).await?;
-    if !capabilities.contains(&Capability::Idle) {
-        bail!("server does not advertise IDLE; cannot watch");
-    }
-    let condstore = capabilities.contains(&Capability::CondStore)
-        || capabilities.contains(&Capability::QResync);
-    trace!("condstore state tracking: {condstore}");
-
-    let mailbox = Mailbox::try_from(imap.mailbox.clone())
-        .map_err(|_| anyhow!("invalid mailbox name: {}", imap.mailbox))?;
-
-    let mut state = examine_state(stream, &mut fragmentizer, &mailbox, condstore).await?;
-
-    loop {
-        match pump::idle_once(stream, &mut fragmentizer, &shutdown).await? {
-            pump::IdleOutcome::Shutdown => {
-                debug!("end imap watch (shutdown requested)");
-                return Ok(());
-            }
-            pump::IdleOutcome::Refresh => {
-                debug!("end imap watch (idle refresh)");
-                return Ok(());
-            }
-            pump::IdleOutcome::Data => {}
-        }
-
-        let next = examine_state(stream, &mut fragmentizer, &mailbox, condstore).await?;
-        if next == state {
-            continue;
-        }
-        trace!("mailbox state advanced: {state} -> {next}");
-        state = next.clone();
-        let ring = CarillonEvent::ring(account, CarillonSource::Imap, &imap.mailbox, Some(next));
-        if events.send(ring).await.is_err() {
-            bail!("event channel closed");
-        }
-    }
-}
-
-/// Authenticates an opened stream (`LOGIN` for a password, SASL
-/// `OAUTHBEARER` for a bearer token), returning the post-authentication
-/// capabilities (where IDLE surfaces).
-async fn authenticate<S>(
-    stream: &mut S,
-    fragmentizer: &mut Fragmentizer,
-    imap: &CarillonImapBackend,
-    credential: &CarillonCredential,
-) -> Result<Vec<Capability<'static>>>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    match credential {
-        CarillonCredential::Password(password) => {
-            let opts = ImapLoginOptions {
-                ensure_capabilities: true,
-                auto_id: None,
-            };
-            let login = ImapLogin::new(&imap.login, password.expose_secret(), opts)
-                .context("invalid IMAP credentials")?;
-            pump::run(stream, fragmentizer, login)
-                .await?
-                .context("IMAP login failed")
-        }
-        CarillonCredential::Bearer(token) => {
-            let opts = ImapAuthOauthbearerOptions {
-                initial_request: true,
-                ensure_capabilities: true,
-                auto_id: None,
-            };
-            let auth = ImapAuthOauthbearer::new(
-                &imap.login,
-                &imap.host,
-                imap.port,
-                token.expose_secret(),
-                opts,
-            );
-            pump::run(stream, fragmentizer, auth)
-                .await?
-                .context("IMAP OAUTHBEARER authentication failed")
-        }
-    }
-}
-
-/// Reads the mailbox state token by a read-only `EXAMINE`. With `condstore`
-/// the token is `UIDVALIDITY:HIGHESTMODSEQ`, which advances on any change
-/// (new mail, flags, deletes); otherwise `UIDVALIDITY:UIDNEXT`, which
-/// advances on new mail only. A `UIDVALIDITY` change (a mailbox reset) also
-/// advances it.
-async fn examine_state<S>(
-    stream: &mut S,
-    fragmentizer: &mut Fragmentizer,
-    mailbox: &Mailbox<'static>,
+    idle_done: Arc<AtomicBool>,
     condstore: bool,
-) -> Result<String>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let parameters = if condstore {
-        vec![SelectParameter::CondStore]
+    state: Option<String>,
+    phase: Phase,
+}
+
+/// The current step of the watch conversation.
+enum Phase {
+    Greeting(ImapGreetingGet),
+    Auth(Auth),
+    ExamineSeed(ImapMailboxExamine),
+    Idle(ImapIdle),
+    ExamineDiff(ImapMailboxExamine),
+    Failed(String),
+    Ended,
+}
+
+/// The authentication sub-coroutine, one per mechanism.
+enum Auth {
+    Login(ImapLogin),
+    Oauth(ImapAuthOauthbearer),
+}
+
+/// The outcome of advancing the authentication phase.
+enum AuthStep {
+    /// The auth coroutine needs I/O; hand this back to the driver.
+    Io(CarillonImapWatchProgress),
+    /// Authentication finished; the loop advances to EXAMINE.
+    Continue,
+    /// Authentication ended the watch (missing IDLE, or an error).
+    Done(CarillonImapWatchProgress),
+}
+
+impl CarillonImapWatch {
+    /// Creates a watch over an as-yet-unopened connection. `shutdown`, when
+    /// set (typically from a signal handler on another thread), winds the
+    /// IDLE down cleanly and completes the watch.
+    pub fn new(
+        imap: CarillonImapBackend,
+        credential: CarillonCredential,
+        shutdown: Arc<AtomicBool>,
+    ) -> Self {
+        let (mailbox, phase) = match Mailbox::try_from(imap.mailbox.clone()) {
+            Ok(mailbox) => (
+                mailbox,
+                Phase::Greeting(ImapGreetingGet::new(ImapGreetingGetOptions {
+                    ensure_capabilities: true,
+                })),
+            ),
+            Err(_) => (
+                Mailbox::Inbox,
+                Phase::Failed(format!("invalid mailbox name: {}", imap.mailbox)),
+            ),
+        };
+        Self {
+            imap,
+            credential,
+            mailbox,
+            fragmentizer: Fragmentizer::new(MAX_MESSAGE_SIZE),
+            shutdown,
+            idle_done: Arc::new(AtomicBool::new(false)),
+            condstore: false,
+            state: None,
+            phase,
+        }
+    }
+
+    /// Advances the watch, returning the next action for the driver. After
+    /// a [`WantsRead`](CarillonImapWatchProgress::WantsRead), pass the bytes
+    /// just read as `input`; otherwise pass `None`.
+    pub fn resume(&mut self, input: Option<&[u8]>) -> CarillonImapWatchProgress {
+        use CarillonImapWatchProgress as Progress;
+
+        let mut input = input;
+        loop {
+            match core::mem::replace(&mut self.phase, Phase::Ended) {
+                Phase::Greeting(mut greeting) => {
+                    match greeting.resume(&mut self.fragmentizer, input.take()) {
+                        ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+                            self.phase = Phase::Greeting(greeting);
+                            return Progress::WantsRead;
+                        }
+                        ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
+                            self.phase = Phase::Greeting(greeting);
+                            return Progress::WantsWrite(bytes);
+                        }
+                        ImapCoroutineState::Complete(Err(err)) => return done_err("greeting", err),
+                        ImapCoroutineState::Complete(Ok(_)) => match self.build_auth() {
+                            Ok(auth) => self.phase = Phase::Auth(auth),
+                            Err(err) => return Progress::Done(Err(err)),
+                        },
+                    }
+                }
+                Phase::Auth(auth) => match self.resume_auth(auth, input.take()) {
+                    AuthStep::Io(progress) => return progress,
+                    AuthStep::Continue => {}
+                    AuthStep::Done(progress) => return progress,
+                },
+                Phase::ExamineSeed(mut examine) => {
+                    match examine.resume(&mut self.fragmentizer, input.take()) {
+                        ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+                            self.phase = Phase::ExamineSeed(examine);
+                            return Progress::WantsRead;
+                        }
+                        ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
+                            self.phase = Phase::ExamineSeed(examine);
+                            return Progress::WantsWrite(bytes);
+                        }
+                        ImapCoroutineState::Complete(Err(err)) => return done_err("examine", err),
+                        ImapCoroutineState::Complete(Ok(data)) => {
+                            self.state = Some(state_token(&data, self.condstore));
+                            self.phase = Phase::Idle(self.build_idle());
+                        }
+                    }
+                }
+                Phase::Idle(mut idle) => {
+                    if self.shutdown.load(Ordering::SeqCst) {
+                        self.idle_done.store(true, Ordering::SeqCst);
+                    }
+                    match idle.resume(&mut self.fragmentizer, input.take()) {
+                        ImapCoroutineState::Yielded(ImapIdleYield::Event(_)) => {
+                            self.idle_done.store(true, Ordering::SeqCst);
+                            self.phase = Phase::Idle(idle);
+                        }
+                        ImapCoroutineState::Yielded(ImapIdleYield::WantsRead) => {
+                            self.phase = Phase::Idle(idle);
+                            return Progress::WantsRead;
+                        }
+                        ImapCoroutineState::Yielded(ImapIdleYield::WantsWrite(bytes)) => {
+                            self.phase = Phase::Idle(idle);
+                            return Progress::WantsWrite(bytes);
+                        }
+                        ImapCoroutineState::Complete(Err(err)) => return done_err("idle", err),
+                        ImapCoroutineState::Complete(Ok(())) => {
+                            if self.shutdown.load(Ordering::SeqCst) {
+                                return Progress::Done(Ok(()));
+                            }
+                            self.phase = Phase::ExamineDiff(self.build_examine());
+                        }
+                    }
+                }
+                Phase::ExamineDiff(mut examine) => {
+                    match examine.resume(&mut self.fragmentizer, input.take()) {
+                        ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+                            self.phase = Phase::ExamineDiff(examine);
+                            return Progress::WantsRead;
+                        }
+                        ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
+                            self.phase = Phase::ExamineDiff(examine);
+                            return Progress::WantsWrite(bytes);
+                        }
+                        ImapCoroutineState::Complete(Err(err)) => return done_err("examine", err),
+                        ImapCoroutineState::Complete(Ok(data)) => {
+                            let next = state_token(&data, self.condstore);
+                            let changed = self.state.as_deref() != Some(next.as_str());
+                            self.state = Some(next.clone());
+                            self.phase = Phase::Idle(self.build_idle());
+                            if changed {
+                                return Progress::Changed(next);
+                            }
+                        }
+                    }
+                }
+                Phase::Failed(message) => {
+                    return Progress::Done(Err(CarillonWatchError::Imap(message)));
+                }
+                Phase::Ended => return Progress::Done(Ok(())),
+            }
+        }
+    }
+
+    /// Advances the authentication phase, putting the sub-coroutine back on
+    /// a yield and advancing to EXAMINE on success.
+    fn resume_auth(&mut self, auth: Auth, input: Option<&[u8]>) -> AuthStep {
+        use CarillonImapWatchProgress as Progress;
+        match auth {
+            Auth::Login(mut login) => match login.resume(&mut self.fragmentizer, input) {
+                ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+                    self.phase = Phase::Auth(Auth::Login(login));
+                    AuthStep::Io(Progress::WantsRead)
+                }
+                ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
+                    self.phase = Phase::Auth(Auth::Login(login));
+                    AuthStep::Io(Progress::WantsWrite(bytes))
+                }
+                ImapCoroutineState::Complete(Err(err)) => AuthStep::Done(done_err("login", err)),
+                ImapCoroutineState::Complete(Ok(capabilities)) => self.after_auth(capabilities),
+            },
+            Auth::Oauth(mut oauth) => match oauth.resume(&mut self.fragmentizer, input) {
+                ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+                    self.phase = Phase::Auth(Auth::Oauth(oauth));
+                    AuthStep::Io(Progress::WantsRead)
+                }
+                ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
+                    self.phase = Phase::Auth(Auth::Oauth(oauth));
+                    AuthStep::Io(Progress::WantsWrite(bytes))
+                }
+                ImapCoroutineState::Complete(Err(err)) => {
+                    AuthStep::Done(done_err("oauthbearer", err))
+                }
+                ImapCoroutineState::Complete(Ok(capabilities)) => self.after_auth(capabilities),
+            },
+        }
+    }
+
+    /// Post-authentication: require IDLE, record CONDSTORE support, and move
+    /// to the seeding EXAMINE.
+    fn after_auth(&mut self, capabilities: Vec<Capability<'static>>) -> AuthStep {
+        if !capabilities.contains(&Capability::Idle) {
+            return AuthStep::Done(CarillonImapWatchProgress::Done(Err(
+                CarillonWatchError::Imap("server does not advertise IDLE; cannot watch".into()),
+            )));
+        }
+        self.condstore = capabilities.contains(&Capability::CondStore)
+            || capabilities.contains(&Capability::QResync);
+        self.phase = Phase::ExamineSeed(self.build_examine());
+        AuthStep::Continue
+    }
+
+    /// Builds the authentication sub-coroutine for the resolved credential.
+    fn build_auth(&self) -> Result<Auth, CarillonWatchError> {
+        match &self.credential {
+            CarillonCredential::Password(password) => {
+                let login = ImapLogin::new(
+                    &self.imap.login,
+                    password.expose_secret(),
+                    ImapLoginOptions {
+                        ensure_capabilities: true,
+                        auto_id: None,
+                    },
+                )
+                .map_err(|err| {
+                    CarillonWatchError::Imap(format!("invalid IMAP credentials: {err}"))
+                })?;
+                Ok(Auth::Login(login))
+            }
+            CarillonCredential::Bearer(token) => {
+                let oauth = ImapAuthOauthbearer::new(
+                    &self.imap.login,
+                    &self.imap.host,
+                    self.imap.port,
+                    token.expose_secret(),
+                    ImapAuthOauthbearerOptions {
+                        initial_request: true,
+                        ensure_capabilities: true,
+                        auto_id: None,
+                    },
+                );
+                Ok(Auth::Oauth(oauth))
+            }
+        }
+    }
+
+    /// Builds a read-only EXAMINE, requesting CONDSTORE when the server
+    /// advertised it so the state token can track HIGHESTMODSEQ.
+    fn build_examine(&self) -> ImapMailboxExamine {
+        let parameters = if self.condstore {
+            vec![SelectParameter::CondStore]
+        } else {
+            Vec::new()
+        };
+        ImapMailboxExamine::new(
+            self.mailbox.clone(),
+            ImapMailboxExamineOptions { parameters },
+        )
+    }
+
+    /// Builds a fresh IDLE with a new wind-down flag stored on `self`.
+    fn build_idle(&mut self) -> ImapIdle {
+        let done = Arc::new(AtomicBool::new(false));
+        self.idle_done = done.clone();
+        ImapIdle::new(done, ImapIdleOptions::default())
+    }
+}
+
+/// Folds an EXAMINE response into the opaque state token. With `condstore`
+/// it is `UIDVALIDITY:HIGHESTMODSEQ` (advancing on any change); otherwise
+/// `UIDVALIDITY:UIDNEXT` (advancing on new mail only).
+fn state_token(data: &ExamineData, condstore: bool) -> String {
+    let validity = data.uid_validity.map(|uid| uid.get()).unwrap_or(0);
+    let uid_next = || data.uid_next.map(|uid| u64::from(uid.get()));
+    let seq = if condstore {
+        data.highest_mod_seq.or_else(uid_next).unwrap_or(0)
     } else {
-        Vec::new()
+        uid_next().unwrap_or(0)
     };
-    let examine =
-        ImapMailboxExamine::new(mailbox.clone(), ImapMailboxExamineOptions { parameters });
-    let data = pump::run(stream, fragmentizer, examine).await??;
-    let validity = data.uid_validity.map(|v| v.get()).unwrap_or(0);
-    let seq = data
-        .highest_mod_seq
-        .or_else(|| data.uid_next.map(|u| u64::from(u.get())))
-        .unwrap_or(0);
-    Ok(format!("{validity}:{seq}"))
+    format!("{validity}:{seq}")
+}
+
+/// Ends the watch with a contextual IMAP error.
+fn done_err(context: &str, err: impl core::fmt::Display) -> CarillonImapWatchProgress {
+    CarillonImapWatchProgress::Done(Err(CarillonWatchError::Imap(format!("{context}: {err}"))))
 }

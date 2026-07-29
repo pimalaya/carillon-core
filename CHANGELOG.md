@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file, following [Keep
 
 ## [Unreleased]
 
+### Changed
+
+- Made core I/O-free. The watch is now a coroutine, `imap::CarillonImapWatch`, whose `resume` returns what the driver must do next (`WantsRead`, `WantsWrite`, `Changed`, `Done`) rather than performing async I/O itself. Each frontend brings its own driver and picks blocking or async I/O.
+
+  Core dropped `tokio`, `mpsc`, `anyhow`, `log`, and `rand`. `CarillonEvent::ring` became the pure `CarillonEvent::new`; the driver now mints `id` and `ts`, since a random id and a clock read are effects an I/O-free core does not perform.
+
 ### Added
 
 - Scaffolded the crate: the content-free `CarillonEvent` and `CarillonSource`, the `CarillonBackend` source description with its `CarillonImapBackend`, `CarillonCardDavBackend` and `CarillonTransportClass`, and the resolved `CarillonCredential`.

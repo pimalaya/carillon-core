@@ -1,12 +1,12 @@
 [package]
 name = "carillon-core"
-description = "Shared async watch client for Carillon"
+description = "Shared I/O-free watch client for Carillon"
 version = "0.0.0"
 authors = ["soywod <pimalaya.org@posteo.net>"]
 rust-version = "1.88"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-categories = ["email", "asynchronous"]
+categories = ["email", "no-std"]
 keywords = ["watch", "imap", "carddav", "idle", "notification"]
 homepage = "https://pimalaya.org"
 documentation = "https://docs.rs/carillon-core/latest/carillon_core"
@@ -18,14 +18,17 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["imap"]
-imap = ["dep:anyhow", "dep:io-imap", "dep:log"]
+imap = ["dep:io-imap"]
+carddav = ["dep:io-webdav", "dep:io-http", "dep:url"]
 
 [dependencies]
-anyhow = { version = "1", optional = true }
+io-http = { version = "0.3", default-features = false, optional = true }
 io-imap = { version = "0.2", default-features = false, optional = true }
-log = { version = "0.4", default-features = false, optional = true }
-rand = "0.10"
+io-webdav = { version = "0.1", default-features = false, optional = true }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 thiserror = { version = "2", default-features = false }
-tokio = { version = "1", default-features = false, features = ["io-util", "sync", "time"] }
+url = { version = "2", optional = true }
+
+[dev-dependencies]
+secrecy = "0.10"

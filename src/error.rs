@@ -13,4 +13,9 @@ pub enum CarillonWatchError {
     /// underlying cause chain.
     #[error("{0}")]
     Imap(String),
+    /// The CardDAV `sync-collection` poll failed (transport dropped,
+    /// authentication rejected, an unexpected response). The message
+    /// carries the underlying cause chain.
+    #[error("{0}")]
+    CardDav(String),
 }

@@ -1,14 +1,16 @@
-//! The change signal a watch emits.
+//! The change signal a watch surfaces.
 //!
 //! A watch says only that something changed at an address, never what
 //! changed. The signal carries no sender, subject, body, UID, resource
-//! href, or change kind. Enriching it is a downstream consumer's job,
-//! since the consumer holds the credentials and can go look. This mirrors
-//! JMAP's StateChange: enough to address and dedup, and nothing more.
+//! href, or change kind. Enriching it is a downstream consumer's job, since
+//! the consumer holds the credentials and can go look. This mirrors JMAP's
+//! StateChange: enough to address and dedup, and nothing more.
+//!
+//! Core is I/O-free, so it never mints the [`id`](CarillonEvent::id) or
+//! [`ts`](CarillonEvent::ts): a random id and a clock read are effects a
+//! driver performs. The watch coroutine surfaces the pure new state, and
+//! the driver assembles the event with [`CarillonEvent::new`].
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use rand::RngExt;
 use serde::Serialize;
 
 /// Which kind of source rang the doorbell.
@@ -24,19 +26,29 @@ pub enum CarillonSource {
     CardDav,
 }
 
+impl CarillonSource {
+    /// The lowercase wire string, matching the serialized form.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CarillonSource::Imap => "imap",
+            CarillonSource::CardDav => "carddav",
+        }
+    }
+}
+
 /// A content-free, self-addressed change signal.
 ///
 /// Content-free is not anonymous. The event stays self-identifying, so a
-/// consumer can route (which target rang) and dedup (whether this state
-/// was already handled). A dropped or duplicated event is harmless, since
-/// the consumer re-derives truth on the next one.
+/// consumer can route (which target rang) and dedup (whether this state was
+/// already handled). A dropped or duplicated event is harmless, since the
+/// consumer re-derives truth on the next one.
 #[derive(Clone, Debug, Serialize)]
 pub struct CarillonEvent {
     /// Unique id, stable across retries so a receiver can dedup and a
-    /// downstream signature covers a constant value.
+    /// downstream signature covers a constant value. Minted by the driver.
     pub id: String,
-    /// Unix timestamp in seconds, stamped once at fold and stable across
-    /// retries.
+    /// Unix timestamp in seconds, stable across retries. Minted by the
+    /// driver.
     pub ts: i64,
     /// The watch (account) this signal belongs to.
     pub account: String,
@@ -51,34 +63,24 @@ pub struct CarillonEvent {
 }
 
 impl CarillonEvent {
-    /// Folds a ring for the given account, source, and target, stamping a
-    /// fresh id and timestamp.
-    pub fn ring(
+    /// Assembles an event from its parts. `id` (dedup) and `ts` (replay)
+    /// are the driver's to mint, since a random id and a clock read are
+    /// effects an I/O-free core does not perform.
+    pub fn new(
+        id: impl Into<String>,
+        ts: i64,
         account: impl Into<String>,
         source: CarillonSource,
         target: impl Into<String>,
         state: Option<String>,
     ) -> Self {
         Self {
-            id: new_id(),
-            ts: now_secs(),
+            id: id.into(),
+            ts,
             account: account.into(),
             source,
             target: target.into(),
             state,
         }
     }
-}
-
-/// Builds a 128-bit random, hex-encoded event id.
-fn new_id() -> String {
-    format!("{:032x}", rand::rng().random::<u128>())
-}
-
-/// Returns the current Unix time in seconds, or 0 before the epoch.
-fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs() as i64)
-        .unwrap_or(0)
 }
