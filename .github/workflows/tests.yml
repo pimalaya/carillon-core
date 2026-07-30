@@ -1,0 +1,33 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    uses: pimalaya/nix/.github/workflows/tests.yml@master
+    secrets: inherit
+
+  fuzz-regression:
+    name: fuzz corpus replay
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Loosen ASan shadow-memory ASLR for the libFuzzer runner
+        # ubuntu-latest sets vm.mmap_rnd_bits=32, which LLVM's AddressSanitizer
+        # cannot map its shadow memory under; lower it to a value ASan supports.
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Replay the committed seed corpus through each target
+        # `-runs=0` replays each seed once (parse without a panic/hang oracle),
+        # no fuzzing — so a regression on a previously-handled hostile input
+        # fails CI deterministically. Seeds are committed under fuzz/seeds/.
+        run: |
+          for target in imap carddav; do
+            mkdir -p "fuzz/corpus/$target"
+            cp "fuzz/seeds/$target/"* "fuzz/corpus/$target/" 2>/dev/null || true
+            cargo fuzz run "$target" "fuzz/corpus/$target" -- -runs=0
+          done

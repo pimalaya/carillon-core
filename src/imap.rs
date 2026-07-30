@@ -364,3 +364,94 @@ fn state_token(data: &ExamineData, condstore: bool) -> String {
 fn done_err(context: &str, err: impl core::fmt::Display) -> CarillonImapWatchProgress {
     CarillonImapWatchProgress::Done(Err(CarillonWatchError::Imap(format!("{context}: {err}"))))
 }
+
+#[cfg(test)]
+mod adversarial_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use secrecy::SecretString;
+
+    use super::{CarillonImapWatch, CarillonImapWatchProgress, MAX_MESSAGE_SIZE};
+    use crate::backend::CarillonImapBackend;
+    use crate::credential::CarillonCredential;
+
+    fn watch() -> CarillonImapWatch {
+        CarillonImapWatch::new(
+            CarillonImapBackend {
+                host: "imap.example.org".into(),
+                port: 993,
+                login: "user@example.org".into(),
+                mailbox: "INBOX".into(),
+            },
+            CarillonCredential::Password(SecretString::from("password".to_owned())),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    /// Drives `resume` up to `cap` steps, feeding `hostile` the first time the
+    /// parser asks to read and empty slices (EOF-ish) thereafter. Returns whether
+    /// the watch reached `Done`. A panic or a hang (cap exceeded under a CI
+    /// timeout) is exactly the failure this hunts: a malicious server must not be
+    /// able to crash or wedge the process that holds every account's credentials.
+    fn drive(watch: &mut CarillonImapWatch, hostile: &[u8], cap: usize) -> bool {
+        let mut fed = false;
+        let mut next: Option<Vec<u8>> = None;
+        for _ in 0..cap {
+            match watch.resume(next.take().as_deref()) {
+                CarillonImapWatchProgress::WantsRead => {
+                    next = Some(if fed { Vec::new() } else { hostile.to_vec() });
+                    fed = true;
+                }
+                CarillonImapWatchProgress::WantsWrite(_) => next = None,
+                CarillonImapWatchProgress::Changed(_) => next = None,
+                CarillonImapWatchProgress::Done(_) => return true,
+            }
+        }
+        false
+    }
+
+    /// Malformed / hostile server bytes fed where a greeting/response is parsed.
+    const CORPUS: &[&[u8]] = &[
+        b"",
+        b"\r\n",
+        b"\n",
+        b"\r",
+        b"\x00\x00\x00\x00",
+        b"\xff\xfe\xfd\xfc garbage \xff\r\n",
+        b"* OK",
+        b"* OK unterminated greeting with no crlf",
+        b"* OK [CAPABILITY IMAP4rev1 IDLE] ready\r\n",
+        b"* PREAUTH already in\r\n",
+        b"* BYE go away\r\n",
+        b"not a greeting at all, just noise\r\n",
+        b"* OK ((((((((((((((((((((deep))))))))))))))))))))\r\n",
+        b"* OK \x00 embedded null \x00 here\r\n",
+        b"* 999999999999999999999999999999 EXISTS\r\n",
+        b"* OK [ALERT] \xc3\x28 invalid utf8 seq\r\n",
+        b"* STATUS INBOX (MESSAGES notanumber UIDNEXT nope)\r\n",
+        b"tag OK done without any untagged\r\n",
+        b"* OK {5}\r\nhi\r\n",
+        b"+ continuation without a request\r\n",
+    ];
+
+    #[test]
+    fn resume_never_panics_on_hostile_input() {
+        for hostile in CORPUS {
+            let mut w = watch();
+            drive(&mut w, hostile, 256);
+        }
+    }
+
+    #[test]
+    fn oversized_literal_is_rejected_by_the_buffer_bound() {
+        // Announce a literal one byte past the 1 MiB fragmentizer bound: the
+        // parser must reject it and end the watch, never buffer megabytes.
+        let announce = format!("* OK {{{}}}\r\n", u64::from(MAX_MESSAGE_SIZE) + 1);
+        let mut w = watch();
+        assert!(
+            drive(&mut w, announce.as_bytes(), 256),
+            "an over-bound literal must terminate the watch, not stall"
+        );
+    }
+}

@@ -130,3 +130,75 @@ fn webdav_auth(backend: &CarillonCardDavBackend, credential: &CarillonCredential
         }
     }
 }
+
+#[cfg(test)]
+mod adversarial_tests {
+    use std::time::Duration;
+
+    use secrecy::SecretString;
+    use url::Url;
+
+    use super::{CarillonCardDavPoll, CarillonCardDavPollProgress};
+    use crate::backend::CarillonCardDavBackend;
+    use crate::credential::CarillonCredential;
+
+    fn poll() -> CarillonCardDavPoll {
+        let base = Url::parse("https://dav.example.org").unwrap();
+        let backend = CarillonCardDavBackend {
+            url: "https://dav.example.org/addressbooks/u/default/".into(),
+            login: "user".into(),
+            poll: Duration::from_secs(60),
+        };
+        let credential = CarillonCredential::Password(SecretString::from("password".to_owned()));
+        CarillonCardDavPoll::new(
+            &base,
+            &backend,
+            &credential,
+            "/addressbooks/u/default/",
+            None,
+        )
+    }
+
+    /// Drives `resume` up to `cap` steps, feeding `hostile` at the first read and
+    /// EOF (empty slice) thereafter. A panic or a hang is the failure hunted:
+    /// the poll parses an attacker-influenced server's HTTP+XML in-process.
+    fn drive(poll: &mut CarillonCardDavPoll, hostile: &[u8], cap: usize) -> bool {
+        let mut fed = false;
+        let mut next: Option<Vec<u8>> = None;
+        for _ in 0..cap {
+            match poll.resume(next.take().as_deref()) {
+                CarillonCardDavPollProgress::WantsRead => {
+                    next = Some(if fed { Vec::new() } else { hostile.to_vec() });
+                    fed = true;
+                }
+                CarillonCardDavPollProgress::WantsWrite(_) => next = None,
+                CarillonCardDavPollProgress::Done(_) => return true,
+            }
+        }
+        false
+    }
+
+    /// Hostile HTTP responses / `sync-collection` XML bodies.
+    const CORPUS: &[&[u8]] = &[
+        b"",
+        b"garbage not http\r\n\r\n",
+        b"HTTP/1.1 207 Multi-Status\r\n\r\n",
+        b"HTTP/1.1 207 Multi-Status\r\nContent-Length: 999999999\r\n\r\n<a/>",
+        b"HTTP/1.1 207 Multi-Status\r\nContent-Length: 24\r\n\r\n<multistatus>truncated",
+        b"HTTP/1.1 207\r\n\r\n<<<<<<<< not xml >>>>>>>>",
+        b"HTTP/1.1 207 Multi-Status\r\nContent-Length: 44\r\n\r\n<m><r><r><r><r><r><r><r><r></m>",
+        b"HTTP/1.1 500 Boom\r\nContent-Length: 2\r\n\r\nno",
+        b"HTTP/1.1 207 \xff\xfe\r\n\r\n\x00\x00\x00",
+        b"HTTP/0.9 nonsense response",
+        b"HTTP/1.1 207 Multi-Status\r\nTransfer-Encoding: chunked\r\n\r\nZZZ\r\n",
+        b"HTTP/1.1 207 OK\r\nContent-Length: 10\r\n\r\n<x>\xc3\x28</x>",
+    ];
+
+    #[test]
+    fn resume_never_panics_on_hostile_input() {
+        for hostile in CORPUS {
+            let mut p = poll();
+            drive(&mut p, hostile, 256);
+        }
+    }
+}

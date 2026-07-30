@@ -1,0 +1,31 @@
+[package]
+name = "carillon-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+secrecy = "0.10"
+url = "2"
+carillon-core = { path = "..", features = ["imap", "carddav"] }
+
+[[bin]]
+name = "imap"
+path = "fuzz_targets/imap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "carddav"
+path = "fuzz_targets/carddav.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the parent package so `cargo fuzz` builds this crate standalone.
+[workspace]

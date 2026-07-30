@@ -54,6 +54,14 @@ The watch coroutine SHALL run one connection's worth of watching: greet, authent
 - **WHEN** a read or write fails because the connection was lost
 - **THEN** the driver stops pumping and decides whether and when to reconnect with a fresh coroutine
 
+### Requirement: The parsers are robust against a hostile server
+The watch coroutines parse responses from an as-yet-untrusted, user-named server inside the process that (in a deployment) holds decrypted credentials, so a malicious server is a first-class attack surface. `CarillonImapWatch::resume` and `CarillonCardDavPoll::resume` SHALL treat malformed, truncated, or oversized input as a terminating error — never a panic, an unbounded allocation, or a hang. The IMAP fragmentizer SHALL cap a single message/literal at `MAX_MESSAGE_SIZE` (1 MiB) and reject anything larger rather than buffer it. A stable-Rust adversarial corpus driven through each `resume` under a bounded iteration loop SHALL guard this (a panic or hang is the failure), and a `cargo-fuzz` target per coroutine (`fuzz/`, nightly) SHALL provide coverage-guided fuzzing, with its committed seed corpus replayed in CI (`-runs=0`) as a deterministic regression gate.
+
+#### Scenario: A watch is pointed at a malicious server
+- **GIVEN** a watch whose server feeds malformed responses or announces a literal larger than the buffer bound
+- **WHEN** the driver pumps the coroutine with those bytes
+- **THEN** the coroutine ends the watch with an error rather than panicking, hanging, or allocating without bound
+
 ### Requirement: The IMAP watch is IDLE plus EXAMINE, not a delta watcher
 Because the ring is content-free, the IMAP watch SHALL NOT compute structured per-message deltas. It SHALL require only IDLE: greet, authenticate, read the mailbox state by a read-only EXAMINE, then hold IDLE and, on each wake, re-EXAMINE and ring only when the state token advanced. On a CONDSTORE server the token SHALL be `UIDVALIDITY:HIGHESTMODSEQ`, read by an `EXAMINE (CONDSTORE)` and advancing on any change (new mail, flags, deletes); otherwise it SHALL be `UIDVALIDITY:UIDNEXT`, advancing on new mail only. QRESYNC SHALL NOT be required.
 
